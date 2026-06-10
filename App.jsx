@@ -179,6 +179,14 @@ export default function GlobalRouteNavigator() {
         mapInstance.current.remove();
         mapInstance.current = null;
       }
+      
+      // FIX: Prevent memory leaks / zombie processes if component unmounts while navigating
+      if (simulationTimer.current) {
+        clearInterval(simulationTimer.current);
+      }
+      if (watchIdRef.current && typeof navigator !== 'undefined' && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
     };
   }, []);
 
@@ -405,7 +413,11 @@ export default function GlobalRouteNavigator() {
     }
 
     if (!navState.isActive) {
-      mapInstance.current.fitBounds(polylineRef.current.getBounds(), { padding: [50, 50], animate: true });
+      try {
+        mapInstance.current.fitBounds(polylineRef.current.getBounds(), { padding: [50, 50], animate: true });
+      } catch (e) {
+        console.warn("Could not auto-fit bounds, map panning skipped.");
+      }
     }
   };
 
@@ -635,7 +647,11 @@ export default function GlobalRouteNavigator() {
     setNavState(prev => ({ ...prev, isActive: false, isSimulating: false }));
     
     if (mapInstance.current && polylineRef.current) {
-      mapInstance.current.fitBounds(polylineRef.current.getBounds(), { padding: [50, 50], animate: true });
+      try {
+        mapInstance.current.fitBounds(polylineRef.current.getBounds(), { padding: [50, 50], animate: true });
+      } catch (e) {
+        console.warn("Could not auto-fit bounds on exit, map panning skipped.");
+      }
     }
   };
 
