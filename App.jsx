@@ -5,7 +5,7 @@ import {
   Car, Footprints, Bike, ArrowRightLeft, 
   CheckCircle, Play, Compass, FastForward, Plus, 
   Trash2, History, Bookmark, Volume2, VolumeX, Share2, Download, 
-  LocateFixed, Zap, WifiOff
+  LocateFixed, Zap, WifiOff, Info
 } from 'lucide-react';
 
 // --- CONFIGURATION & HELPERS ---
@@ -48,6 +48,32 @@ const getDistance = (lat1, lon1, lat2, lon2) => {
             Math.sin(dLon/2) * Math.sin(dLon/2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   return R * c; 
+};
+
+// Natural Language Instruction Generator for OSRM
+const buildInstruction = (step) => {
+  if (step?.maneuver?.instruction) return step.maneuver.instruction;
+  
+  const type = step?.maneuver?.type;
+  const modifier = step?.maneuver?.modifier;
+  const name = step?.name;
+
+  if (type === 'depart') return name ? `Head ${modifier || 'forward'} on ${name}` : 'Head forward';
+  if (type === 'arrive') return 'Arrive at your destination';
+  
+  let action = 'Turn';
+  if (type === 'continue' || type === 'new name') action = 'Continue';
+  else if (type === 'merge') action = 'Merge';
+  else if (type === 'on ramp') action = 'Take the ramp';
+  else if (type === 'off ramp') action = 'Take the exit';
+  else if (type === 'fork') action = 'Keep';
+  else if (type === 'roundabout') return name ? `Enter the roundabout and exit onto ${name}` : 'Enter the roundabout';
+
+  if (modifier && type !== 'continue' && type !== 'new name') {
+      action += ` ${modifier.replace('-', ' ')}`;
+  }
+
+  return name ? `${action} onto ${name}` : action;
 };
 
 // --- CUSTOM HOOKS ---
@@ -95,7 +121,6 @@ export default function GlobalRouteNavigator() {
   const [darkMode, setDarkMode] = useLocalStorage('theme_dark', false);
   const [activeTab, setActiveTab] = useState('plan');
   
-  // Waypoints Array replacing start/end point (Multi-stop feature)
   const [waypoints, setWaypoints] = useState([
     { id: 'wp-start', lat: null, lng: null, label: '' },
     { id: 'wp-end', lat: null, lng: null, label: '' }
@@ -117,6 +142,7 @@ export default function GlobalRouteNavigator() {
   // Persistent Data Storage
   const [routeHistory, setRouteHistory] = useLocalStorage('route_history', []);
   const [savedRoutes, setSavedRoutes] = useLocalStorage('saved_routes', []);
+  const [simSpeed, setSimSpeed] = useLocalStorage('sim_speed', 10);
 
   // Navigation State
   const [navState, setNavState] = useState({
@@ -125,39 +151,49 @@ export default function GlobalRouteNavigator() {
     currentStepIndex: 0,
     remainingDistance: 0,
     remainingTime: 0,
+    distanceToNextTurn: 0,
     eta: '',
     currentInstruction: null,
-    simSpeed: 10,
     currentSpeedMph: 0
   });
   
+  // TTS Engine State
   const [voiceEnabled, setVoiceEnabled] = useLocalStorage('voice_enabled', true);
+
   const [autoCenter, setAutoCenter] = useState(true);
-  const [pendingResume, setPendingResume] = useState(null);
+
+  // UI States
+  const [toastMsg, setToastMsg] = useState(null);
+  const [confirmModal, setConfirmModal] = useState(null);
+  const [gpsWarning, setGpsWarning] = useState('');
+  const [locationWarning, setLocationWarning] = useState('');
+  const [isMapLoaded, setIsMapLoaded] = useState(false);
+  const [mapLoadError, setMapLoadError] = useState('');
 
   const simulationTimer = useRef(null);
   const watchIdRef = useRef(null);
   const simIndexRef = useRef(0);
   const lastSpokenInstruction = useRef('');
-
-  // Map & Error Triggers
-  const [isMapLoaded, setIsMapLoaded] = useState(false);
-  const [mapLoadError, setMapLoadError] = useState('');
-  const [gpsWarning, setGpsWarning] = useState('');
-  const [locationWarning, setLocationWarning] = useState('');
   
-  // Synchronized Refs to cure stale closures
+  // Synchronized Refs
   const navStateRef = useRef(navState);
   const routeDataRef = useRef(routeData);
   const travelModeRef = useRef(travelMode);
   const autoCenterRef = useRef(autoCenter);
   const waypointsRef = useRef(waypoints);
+  const simSpeedRef = useRef(simSpeed);
 
   useEffect(() => { navStateRef.current = navState; }, [navState]);
   useEffect(() => { routeDataRef.current = routeData; }, [routeData]);
   useEffect(() => { travelModeRef.current = travelMode; }, [travelMode]);
   useEffect(() => { autoCenterRef.current = autoCenter; }, [autoCenter]);
   useEffect(() => { waypointsRef.current = waypoints; }, [waypoints]);
+  useEffect(() => { simSpeedRef.current = simSpeed; }, [simSpeed]);
+
+  const showToast = (msg) => {
+    setToastMsg(msg);
+    setTimeout(() => setToastMsg(null), 3000);
+  };
 
   // Network Offline Detector
   useEffect(() => {
@@ -191,7 +227,7 @@ export default function GlobalRouteNavigator() {
     }
   }, []);
 
-  // Stage 1: Session Recovery (Mount)
+  // Session Recovery
   useEffect(() => {
     const activeSession = window.localStorage.getItem('activeRouteSession');
     if (activeSession) {
@@ -200,44 +236,38 @@ export default function GlobalRouteNavigator() {
         if (parsed && Array.isArray(parsed.waypoints)) {
           setWaypoints(parsed.waypoints);
           setTravelMode(parsed.travelMode || 'driving');
-          setPendingResume(parsed.isSimulating || false);
+          
+          setTimeout(() => {
+            setConfirmModal({
+              message: "You have an active navigation session. Do you want to resume?",
+              onConfirm: () => {
+                startNavigation(parsed.isSimulating || false);
+                setConfirmModal(null);
+              },
+              onCancel: () => {
+                window.localStorage.removeItem('activeRouteSession');
+                setConfirmModal(null);
+              }
+            });
+          }, 1500);
         }
       } catch (e) { window.localStorage.removeItem('activeRouteSession'); }
     }
   }, []); 
 
-  // Stage 2: Trigger recovered session once route calculates
-  useEffect(() => {
-    if (pendingResume !== null && routeData) {
-      // Small buffer to allow map markers to draw
-      setTimeout(() => {
-        if (window.confirm("You have an active navigation session. Do you want to resume?")) {
-          startNavigation(pendingResume);
-        } else {
-          window.localStorage.removeItem('activeRouteSession');
-        }
-        setPendingResume(null);
-      }, 500);
-    }
-  }, [routeData, pendingResume]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Map Initialization
   useEffect(() => {
     let isMounted = true;
     
-    // Hardened asset loader that polls for execution completion to prevent React double-mount crashes
     const loadAsset = (url, type, id) => new Promise((resolve, reject) => {
       if (document.getElementById(id)) {
-        // If it's already in the DOM, wait until it's actually loaded in memory
         const check = setInterval(() => {
           if (type === 'css' || (type === 'script' && window.L)) {
-            clearInterval(check);
-            resolve();
+            clearInterval(check); resolve();
           }
         }, 50);
         return;
       }
-
       let element = document.createElement(type === 'css' ? 'link' : 'script');
       element.id = id;
       if (type === 'css') { element.rel = 'stylesheet'; element.href = url; } 
@@ -267,10 +297,7 @@ export default function GlobalRouteNavigator() {
 
     return () => { 
       isMounted = false; 
-      if (mapInstance.current) { 
-        mapInstance.current.remove(); 
-        mapInstance.current = null; 
-      }
+      if (mapInstance.current) { mapInstance.current.remove(); mapInstance.current = null; }
       if (simulationTimer.current) clearInterval(simulationTimer.current);
       if (watchIdRef.current && navigator.geolocation) navigator.geolocation.clearWatch(watchIdRef.current);
     };
@@ -297,8 +324,6 @@ export default function GlobalRouteNavigator() {
        handleMapClick(e.latlng.lat, e.latlng.lng);
     });
 
-    // Detect panning to turn off auto-center temporarily
-    // FIX: Switched from dragstart to mousedown/touchstart to prevent programmatic pans from disabling auto-center
     mapInstance.current.on('mousedown touchstart', () => {
        if (navStateRef.current.isActive && autoCenterRef.current) setAutoCenter(false);
     });
@@ -419,12 +444,17 @@ export default function GlobalRouteNavigator() {
 
         const route = data.routes[0];
         
-        // Aggregate steps safely
         let allSteps = [];
         if (route.legs) {
           route.legs.forEach(leg => {
-             const validSteps = leg.steps?.filter(s => s.maneuver?.instruction || s.name) || [];
-             allSteps = [...allSteps, ...validSteps];
+             const mappedSteps = leg.steps?.map(s => ({
+                 ...s,
+                 maneuver: {
+                     ...s.maneuver,
+                     instruction: buildInstruction(s)
+                 }
+             })) || [];
+             allSteps = [...allSteps, ...mappedSteps];
           });
         }
 
@@ -455,8 +485,14 @@ export default function GlobalRouteNavigator() {
 
   // --- DRAWING & MARKERS ---
   const clearMapDrawings = () => {
-    if (polylineRef.current) polylineRef.current.remove?.();
-    if (decoratorRef.current) decoratorRef.current.remove?.();
+    if (polylineRef.current && mapInstance.current) {
+      mapInstance.current.removeLayer(polylineRef.current);
+    }
+    if (decoratorRef.current && mapInstance.current) {
+      mapInstance.current.removeLayer(decoratorRef.current);
+    }
+    polylineRef.current = null;
+    decoratorRef.current = null;
   };
 
   const drawRoute = (geoJsonGeometry) => {
@@ -482,7 +518,6 @@ export default function GlobalRouteNavigator() {
     }
   };
 
-  // Sync Waypoint Markers
   useEffect(() => {
     if (!LRef.current || !mapInstance.current) return;
     const L = LRef.current;
@@ -495,7 +530,9 @@ export default function GlobalRouteNavigator() {
       iconSize: [0, 0], iconAnchor: [0, 0]
     });
 
-    markersRef.current.waypoints.forEach(m => m?.remove?.());
+    markersRef.current.waypoints.forEach(m => {
+       if (mapInstance.current && m) mapInstance.current.removeLayer(m);
+    });
     markersRef.current.waypoints = [];
 
     if (navState.isActive) return; 
@@ -514,18 +551,19 @@ export default function GlobalRouteNavigator() {
 
   // --- TTS VOICE ---
   const speakInstruction = (text) => {
-    if (!voiceEnabled || !('speechSynthesis' in window)) return;
+    if (!voiceEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     if (text === lastSpokenInstruction.current) return; 
     
     try {
       window.speechSynthesis.cancel();
       const msg = new SpeechSynthesisUtterance(text);
+
       msg.rate = 1.0;
       msg.pitch = 1.0;
       window.speechSynthesis.speak(msg);
       lastSpokenInstruction.current = text;
     } catch (e) {
-      console.warn("Speech Synthesis blocked by browser.");
+      console.warn("Speech Synthesis blocked.");
     }
   };
 
@@ -562,19 +600,19 @@ export default function GlobalRouteNavigator() {
     if (!currentRouteData) return;
     
     updateUserLocationMarker(lat, lng);
-    
     const mph = Math.round((speedMps || 0) * 2.23694);
 
     setNavState(prev => {
       const steps = currentRouteData.steps || [];
       let nextStepIdx = prev.currentStepIndex;
+      
+      let targetCoords = steps[nextStepIdx]?.maneuver?.location;
+      let distToTurn = targetCoords ? getDistance(lat, lng, targetCoords[1], targetCoords[0]) : 0;
 
-      if (nextStepIdx < steps.length) {
-        const targetCoords = steps[nextStepIdx].maneuver.location;
-        const distanceToTurn = getDistance(lat, lng, targetCoords[1], targetCoords[0]);
-        if (distanceToTurn < 40) { 
-          nextStepIdx = Math.min(nextStepIdx + 1, steps.length - 1);
-        }
+      if (distToTurn < 30 && nextStepIdx < steps.length - 1) { 
+        nextStepIdx++;
+        targetCoords = steps[nextStepIdx]?.maneuver?.location;
+        distToTurn = targetCoords ? getDistance(lat, lng, targetCoords[1], targetCoords[0]) : 0;
       }
 
       const safeTotalCoords = Math.max(1, currentRouteData.geometry?.coordinates?.length - 1 || 1);
@@ -586,7 +624,7 @@ export default function GlobalRouteNavigator() {
       const remainingTime = Math.max(0, currentRouteData.duration * (1 - progressRatio));
 
       const currentStep = steps[nextStepIdx];
-      const newInstruction = currentStep?.maneuver?.instruction || 'Arrive at destination';
+      const newInstruction = currentStep?.maneuver?.instruction || 'Proceed to route';
 
       if (newInstruction !== prev.currentInstruction) {
         speakInstruction(newInstruction);
@@ -596,11 +634,19 @@ export default function GlobalRouteNavigator() {
         ...prev,
         currentStepIndex: nextStepIdx,
         currentInstruction: newInstruction,
+        distanceToNextTurn: distToTurn,
         remainingDistance: remainingDist,
         remainingTime: remainingTime,
         currentSpeedMph: mph
       };
     });
+  };
+
+  const changeSimulationSpeed = (newSpeed) => {
+    setSimSpeed(newSpeed);
+    if (navStateRef.current.isActive && navStateRef.current.isSimulating) {
+      startSimulationLoop(newSpeed);
+    }
   };
 
   const startSimulationLoop = (speedMultiplier) => {
@@ -615,7 +661,7 @@ export default function GlobalRouteNavigator() {
     simulationTimer.current = setInterval(() => {
       const currentIdx = simIndexRef.current;
       if (currentIdx >= coords.length - 1) {
-        setNavState(prev => ({ ...prev, currentInstruction: "You have arrived at your destination!", remainingDistance: 0, remainingTime: 0 }));
+        setNavState(prev => ({ ...prev, currentInstruction: "You have arrived at your destination!", remainingDistance: 0, remainingTime: 0, distanceToNextTurn: 0 }));
         speakInstruction("You have arrived at your destination.");
         clearInterval(simulationTimer.current);
         setTimeout(() => stopNavigation(), 4000);
@@ -676,7 +722,7 @@ export default function GlobalRouteNavigator() {
       remainingTime: currentRouteData.duration,
       eta: calculateETA(currentRouteData.duration),
       currentInstruction: currentRouteData.steps?.[0]?.maneuver?.instruction || 'Head towards destination',
-      simSpeed: 10,
+      distanceToNextTurn: 0,
       currentSpeedMph: 0
     });
     
@@ -685,7 +731,7 @@ export default function GlobalRouteNavigator() {
 
     if (simulate) {
       simIndexRef.current = 0;
-      startSimulationLoop(10); 
+      startSimulationLoop(simSpeedRef.current); 
     } else {
       watchIdRef.current = navigator.geolocation.watchPosition(
         (position) => {
@@ -701,7 +747,6 @@ export default function GlobalRouteNavigator() {
     }
   };
 
-  // Keep Session Active in LocalStorage
   useEffect(() => {
     if (navState.isActive) {
       if (typeof window !== 'undefined') {
@@ -717,7 +762,10 @@ export default function GlobalRouteNavigator() {
     if (watchIdRef.current && typeof navigator !== 'undefined' && navigator.geolocation) { 
       navigator.geolocation.clearWatch(watchIdRef.current); watchIdRef.current = null; 
     }
-    if (markersRef.current.user) { markersRef.current.user?.remove?.(); markersRef.current.user = null; }
+    if (markersRef.current.user && mapInstance.current) { 
+      mapInstance.current.removeLayer(markersRef.current.user); 
+      markersRef.current.user = null; 
+    }
     
     setNavState(prev => ({ ...prev, isActive: false, isSimulating: false }));
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -729,7 +777,7 @@ export default function GlobalRouteNavigator() {
     }
   };
 
-  // --- ADVANCED FEATURES (Save, Export, Share, Optimize) ---
+  // --- ADVANCED FEATURES ---
   const saveRouteToHistory = (data, wps) => {
     const routeEntry = { id: Date.now(), name: data.name, waypoints: wps, distance: data.distance, date: new Date().toLocaleDateString() };
     setRouteHistory(prev => {
@@ -745,8 +793,10 @@ export default function GlobalRouteNavigator() {
     const isSaved = safeSaved.some(r => r && r.name === routeData.name);
     if (isSaved) {
       setSavedRoutes(safeSaved.filter(r => r && r.name !== routeData.name));
+      showToast("Route removed from saved trips.");
     } else {
       setSavedRoutes([{ id: Date.now(), name: routeData.name, waypoints }, ...safeSaved]);
+      showToast("Route saved successfully!");
     }
   };
 
@@ -760,8 +810,18 @@ export default function GlobalRouteNavigator() {
   const shareRoute = () => {
     const wpsStr = JSON.stringify(waypoints.filter(w => w.lat));
     const url = `${window.location.origin}${window.location.pathname}#route=${btoa(wpsStr)}`;
-    navigator.clipboard.writeText(url);
-    alert("Route URL copied to clipboard!");
+    
+    const textArea = document.createElement("textarea");
+    textArea.value = url;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      showToast("Route URL copied to clipboard!");
+    } catch (err) {
+      showToast("Failed to copy URL.");
+    }
+    document.body.removeChild(textArea);
   };
 
   const exportGPX = () => {
@@ -779,7 +839,10 @@ export default function GlobalRouteNavigator() {
 
   const optimizeRoute = async () => {
     const validWps = waypoints.filter(wp => wp.lat !== null && wp.lng !== null);
-    if (validWps.length < 3) return alert("Need at least 3 points to optimize.");
+    if (validWps.length < 3) {
+      showToast("Need at least 3 points to optimize.");
+      return;
+    }
     
     setLoadingRoute(true);
     try {
@@ -796,22 +859,34 @@ export default function GlobalRouteNavigator() {
         });
         if (optimizedWps.length === validWps.length) {
           setWaypoints(optimizedWps);
+          showToast("Route successfully optimized!");
         }
       }
-    } catch(e) {}
+    } catch(e) {
+      showToast("Optimization failed.");
+    }
     finally { setLoadingRoute(false); }
   };
 
   const centerOnUser = () => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) return;
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      showToast("Could not access location.");
+      return;
+    }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         if (mapInstance.current) {
           mapInstance.current.setView([pos.coords.latitude, pos.coords.longitude], 15, { animate: true });
         }
       },
-      (err) => {}
+      (err) => showToast("Location permission denied.")
     );
+  };
+
+  const zoomToStep = (coords) => {
+    if (mapInstance.current && coords && !navState.isActive) {
+      mapInstance.current.setView([coords[1], coords[0]], 18, { animate: true });
+    }
   };
 
 
@@ -897,14 +972,14 @@ export default function GlobalRouteNavigator() {
         )}
 
         {routeError && (
-          <div className="p-6 text-center animate-in fade-in mt-10">
+          <div className="p-6 text-center mt-10">
             <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-3" />
             <p className="text-red-500 font-medium">{routeError}</p>
           </div>
         )}
 
         {routeData && !loadingRoute && (
-          <div className="animate-in fade-in duration-500">
+          <div className="duration-500">
             <div className="bg-blue-600 text-white p-6 shadow-md relative overflow-hidden">
               <div className="absolute right-0 top-0 opacity-10 transform translate-x-4 -translate-y-4">
                 <Route className="w-48 h-48" />
@@ -1055,6 +1130,14 @@ export default function GlobalRouteNavigator() {
         .navigation-user-marker { transition: transform 0.25s linear; }
       `}} />
 
+      {/* TOAST NOTIFICATION */}
+      {toastMsg && (
+        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-[200] bg-slate-900 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 font-bold text-sm">
+          <Info className="w-4 h-4 text-blue-400" />
+          {toastMsg}
+        </div>
+      )}
+
       {/* OFFLINE INDICATOR */}
       {isOffline && (
         <div className="absolute top-0 left-0 right-0 z-[200] bg-red-600 text-white text-xs font-bold text-center py-1.5 flex items-center justify-center gap-2">
@@ -1062,10 +1145,25 @@ export default function GlobalRouteNavigator() {
         </div>
       )}
 
+      {/* CONFIRM MODAL */}
+      {confirmModal && (
+        <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl max-w-md w-full p-8 text-center border border-slate-100 dark:border-slate-700">
+            <div className="w-20 h-20 bg-blue-100 dark:bg-blue-900/30 text-blue-500 rounded-full flex items-center justify-center mx-auto mb-6"><Navigation className="w-10 h-10" /></div>
+            <h2 className="text-xl font-black mb-3">Active Session Found</h2>
+            <p className="text-slate-600 dark:text-slate-300 mb-8">{confirmModal.message}</p>
+            <div className="flex gap-4">
+              <button onClick={confirmModal.onCancel} className="flex-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold py-3.5 rounded-xl transition-colors">Discard</button>
+              <button onClick={confirmModal.onConfirm} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 rounded-xl transition-colors">Resume</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* POPUP MODALS */}
       {locationWarning && (
         <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl max-w-md w-full p-8 text-center animate-in zoom-in-95 border border-slate-100 dark:border-slate-700">
+          <div className="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl max-w-md w-full p-8 text-center border border-slate-100 dark:border-slate-700">
             <div className="w-20 h-20 bg-red-100 dark:bg-red-900/30 text-red-500 rounded-full flex items-center justify-center mx-auto mb-6"><MapPin className="w-10 h-10" /></div>
             <h2 className="text-2xl font-black mb-3">Too Far From Route</h2>
             <p className="text-slate-600 dark:text-slate-300 mb-8">{locationWarning}</p>
@@ -1088,16 +1186,19 @@ export default function GlobalRouteNavigator() {
 
           {/* Top Big Turn Instruction */}
           <div className="bg-green-600 dark:bg-green-700 text-white p-5 md:p-6 shadow-2xl pointer-events-auto rounded-b-3xl">
-            <div className="max-w-4xl mx-auto flex items-center gap-4 md:gap-6">
-               <div className="bg-green-800/50 p-3 md:p-4 rounded-2xl">
+            <div className="max-w-4xl mx-auto flex items-start md:items-center gap-4 md:gap-6">
+               <div className="bg-green-800/50 p-3 md:p-4 rounded-2xl mt-1 md:mt-0">
                   <Compass className="w-8 h-8 md:w-12 md:h-12 animate-pulse" />
                </div>
                <div className="flex-1">
-                  <h2 className="text-[10px] md:text-sm font-bold text-green-200 uppercase tracking-widest mb-1">Upcoming Turn</h2>
+                  <h2 className="text-[10px] md:text-sm font-bold text-green-200 uppercase tracking-widest mb-1">
+                    {navState.distanceToNextTurn > 0 ? `In ${formatDistance(navState.distanceToNextTurn, true)}` : 'Upcoming Turn'}
+                  </h2>
                   <p className="text-xl md:text-4xl font-extrabold tracking-tight leading-tight line-clamp-2">
                     {navState.currentInstruction || "Proceed to route"}
                   </p>
                </div>
+
                {/* Nav Controls */}
                <div className="flex flex-col gap-2">
                  <button onClick={()=>setVoiceEnabled(!voiceEnabled)} className={`p-3 rounded-full transition-colors ${voiceEnabled ? 'bg-green-500 hover:bg-green-400' : 'bg-green-800 text-slate-300 hover:bg-green-900'}`}>
@@ -1118,7 +1219,7 @@ export default function GlobalRouteNavigator() {
               <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2"><FastForward className="w-4 h-4 text-blue-400" /> Speed</span>
               <div className="flex gap-1.5">
                 {[1, 5, 10, 25, 50].map(s => (
-                  <button key={s} onClick={() => changeSimulationSpeed(s)} className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all ${navState.simSpeed === s ? 'bg-blue-500 text-white' : 'bg-slate-800 hover:bg-slate-700'}`}>{s}x</button>
+                  <button key={s} onClick={() => changeSimulationSpeed(s)} className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all ${simSpeed === s ? 'bg-blue-500 text-white' : 'bg-slate-800 hover:bg-slate-700'}`}>{s}x</button>
                 ))}
               </div>
             </div>
@@ -1163,7 +1264,7 @@ export default function GlobalRouteNavigator() {
 
 
       {/* MAIN UI SIDEBAR */}
-      <div className={`w-full md:w-[420px] h-[50vh] md:h-screen flex flex-col bg-white dark:bg-slate-900 shadow-2xl z-20 transition-transform duration-500 ${navState.isActive ? '-translate-x-full absolute opacity-0' : 'relative'}`}>
+      <div className={`w-full md:w-[420px] flex flex-col bg-white dark:bg-slate-900 shadow-2xl z-20 transition-transform duration-500 ${navState.isActive ? '-translate-x-full absolute opacity-0 h-screen' : 'relative h-[50vh] md:h-screen'}`}>
         
         {/* Header */}
         <div className="px-6 py-5 border-b border-slate-200 dark:border-slate-800 shrink-0 flex justify-between items-center bg-white dark:bg-slate-900">
@@ -1208,7 +1309,7 @@ export default function GlobalRouteNavigator() {
             </div>
             
             {gpsWarning && (
-              <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 rounded-lg flex items-start gap-2 animate-in fade-in">
+              <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 rounded-lg flex items-start gap-2">
                 <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
                 <p className="text-xs text-amber-700 dark:text-amber-400">{gpsWarning}</p>
               </div>
@@ -1224,7 +1325,7 @@ export default function GlobalRouteNavigator() {
       </div>
 
       {/* MAP VIEWPORT */}
-      <div className="flex-1 relative bg-slate-200 dark:bg-slate-800 h-[50vh] md:h-screen">
+      <div className={`flex-1 relative bg-slate-200 dark:bg-slate-800 ${navState.isActive ? 'h-screen' : 'h-[50vh] md:h-screen'}`}>
         <div id="map" ref={mapRef} className="w-full h-full absolute inset-0 z-0"></div>
         
         {/* Floating Map Controls */}
